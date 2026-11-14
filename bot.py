@@ -2,6 +2,7 @@ import json
 import time
 import base64
 import os
+import uuid
 import asyncio
 import threading
 import urllib.request
@@ -33,6 +34,10 @@ game_state = {}
 combat_tracker = {}
 combat_seq = 0
 last_sync_time = 0
+kill_session = str(uuid.uuid4())
+kill_totals = [0, 0, 0, 0, 0, 0, 0, 0]
+current_map_stage = 1
+server_deployed = []
 
 # --------------- helpers ---------------
 
@@ -290,28 +295,35 @@ def build_combat_payload(deployed_ids):
                 "kills": combat_tracker[tid]["kills"][:],
             })
     return {
+        "killSession": kill_session,
+        "killTotals": kill_totals[:],
+        "killStage": current_map_stage,
         "combatVersion": 1,
         "combatSeq": combat_seq,
         "combatHeroes": hero_reports,
         "deployed": deployed_ids,
     }
 
-def simulate_combat(deploy_team, elapsed_seconds, chakra_map):
-    global combat_tracker
-    for hero in deploy_team:
+def simulate_combat(heroes_data, elapsed_seconds, chakra_map):
+    global combat_tracker, kill_totals
+    for hero in heroes_data:
         tid = hero.get("tokenId", "")
         if not tid:
             continue
         chakra_info = chakra_map.get(tid, {})
         available = chakra_info.get("value", 0)
+        napping = chakra_info.get("napping")
+        if napping or available < 1:
+            continue
         num_attacks = attacks_in_interval(hero, elapsed_seconds, available)
         if num_attacks <= 0:
             continue
         if tid not in combat_tracker:
             combat_tracker[tid] = {"attacks": 0, "kills": [0, 0, 0, 0, 0]}
         combat_tracker[tid]["attacks"] += num_attacks
-        kills_per = max(1, num_attacks // 3)
-        combat_tracker[tid]["kills"][0] += kills_per
+        kills = max(1, num_attacks // 3)
+        combat_tracker[tid]["kills"][0] += kills
+        kill_totals[0] += kills
 
 def adventure_sync(token, deployed_ids, active=True):
     payload = build_combat_payload(deployed_ids)
@@ -363,11 +375,11 @@ def select_deploy_team(heroes, chakra_map, dojo=0):
 # --------------- farming loop ---------------
 
 def farm_loop(cfg):
-    global start_time, start_balance, cached_token, game_state, combat_tracker, last_sync_time
+    global start_time, start_balance, cached_token, game_state
+    global combat_tracker, last_sync_time, current_map_stage, server_deployed
     poll_interval = cfg.get("poll_interval_seconds", 30)
     consecutive_errors = 0
     sync_counter = 0
-    prev_deployed_ids = []
 
     while True:
         try:
@@ -389,8 +401,9 @@ def farm_loop(cfg):
             heroes = profile.get("heroes", [])
             dojo = profile.get("dojo", 0)
             hero_count = len(heroes)
+            hero_map = {h["tokenId"]: h for h in heroes if h.get("tokenId")}
 
-            initial_sync = adventure_sync(token, prev_deployed_ids, active=True)
+            initial_sync = adventure_sync(token, server_deployed, active=True)
             if "error" in initial_sync:
                 log(f"  Adventure sync error: {initial_sync['error']}")
                 time.sleep(poll_interval)
@@ -401,6 +414,23 @@ def farm_loop(cfg):
             chest_pending = chest.get("pending", 0)
             chest_claimed = chest.get("claimed", 0)
             chest_map = chest.get("map", 1)
+            current_map_stage = max(1, chest_map)
+            server_deployed = chest.get("deployed", [])
+            attack_ack = chest.get("attackAck", {})
+
+            if not server_deployed:
+                deploy_team = select_deploy_team(heroes, chakra_map, dojo)
+                wanted_ids = [h["tokenId"] for h in deploy_team]
+                if wanted_ids:
+                    log(f"  No heroes deployed, sending {len(wanted_ids)} heroes...")
+                    deploy_resp = adventure_sync(token, wanted_ids, active=True)
+                    if "error" not in deploy_resp:
+                        d_chest = deploy_resp if "chakra" in deploy_resp else deploy_resp.get("chest", deploy_resp)
+                        server_deployed = d_chest.get("deployed", [])
+                        chakra_map = d_chest.get("chakra", chakra_map)
+                        chest_pending = d_chest.get("pending", chest_pending)
+                        attack_ack = d_chest.get("attackAck", {})
+                        log(f"  Server accepted {len(server_deployed)} heroes")
 
             if start_time is None:
                 start_time = time.time()
@@ -410,44 +440,50 @@ def farm_loop(cfg):
             earned_session = (balance + bonus) - start_balance
             daily_rate = (earned_session / elapsed_hours * 24) if elapsed_hours > 0.01 else 0
 
-            deploy_team = select_deploy_team(heroes, chakra_map, dojo)
-            deployed_ids = [h["tokenId"] for h in deploy_team]
-
             now = time.time()
             elapsed_since_sync = now - last_sync_time if last_sync_time > 0 else poll_interval
             elapsed_since_sync = min(elapsed_since_sync, poll_interval * 2)
 
-            if deployed_ids and elapsed_since_sync > 0:
-                simulate_combat(deploy_team, elapsed_since_sync, chakra_map)
+            active_heroes = []
+            for tid in server_deployed:
+                h = hero_map.get(tid)
+                if h:
+                    active_heroes.append(h)
 
-            resting_heroes = []
+            if active_heroes and elapsed_since_sync > 0:
+                simulate_combat(active_heroes, elapsed_since_sync, chakra_map)
+
             deployed_heroes = []
+            resting_heroes = []
+            deployed_set = set(server_deployed)
             for h in heroes:
                 tid = h.get("tokenId", "")
                 chakra_info = chakra_map.get(tid, {})
                 en = chakra_info.get("value", 0)
-                mc = max_chakra({**h, "en": en})
+                mc = chakra_info.get("max", max_chakra({**h, "en": en}))
                 pct = (en / mc * 100) if mc > 0 else 0
-                if tid in deployed_ids:
-                    deployed_heroes.append((h, en, pct))
+                napping = chakra_info.get("napping")
+                if tid in deployed_set:
+                    deployed_heroes.append((h, en, mc, pct, napping))
                 else:
                     ttr = time_to_ready({**h, "en": en}, dojo)
                     resting_heroes.append((h, en, pct, ttr))
 
-            total_attacks = sum(combat_tracker.get(tid, {}).get("attacks", 0) for tid in deployed_ids)
+            total_attacks = sum(combat_tracker.get(tid, {}).get("attacks", 0) for tid in server_deployed)
+            acked = sum(attack_ack.values()) if isinstance(attack_ack, dict) else 0
 
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] === Shinobi Bombers ===", flush=True)
             print(f"  Balance: {fmt_amount(balance)} | Bonus: {fmt_amount(bonus)} | Chest: {fmt_amount(chest_pending)} pending / {fmt_amount(chest_claimed)} claimed", flush=True)
-            print(f"  Map stage: {chest_map} | Heroes: {hero_count} | Dojo: {dojo}", flush=True)
+            print(f"  Map stage: {chest_map} | Heroes: {hero_count} | Dojo: {dojo} | Kills: {chest.get('kills', 0)}", flush=True)
             if elapsed_hours > 0.01:
                 print(f"  Session: {fmt_amount(earned_session)} earned in {format_time(elapsed_hours * 3600)} (~{fmt_amount(daily_rate)}/day)", flush=True)
-            print(f"  Deployed: {len(deployed_ids)}/{MAX_DEPLOYED} | Attacks queued: {total_attacks}", flush=True)
+            print(f"  Deployed: {len(server_deployed)}/{MAX_DEPLOYED} | Attacks: {total_attacks} sent / {acked} acked", flush=True)
 
-            for h, en, pct in deployed_heroes:
+            for h, en, mc, pct, napping in deployed_heroes:
                 name = h.get("name", f"Hero#{h.get('tokenId', '?')[:6]}")
                 r = h.get("rank", h.get("r", 0))
-                atk = combat_tracker.get(h.get("tokenId", ""), {}).get("attacks", 0)
-                print(f"    [{rank_name(r)}] {name} - Chakra: {en:.0f}/{max_chakra({**h, 'en': en}):.0f} ({pct:.0f}%) atk:{atk}", flush=True)
+                status = "NAP" if napping else "ATK"
+                print(f"    [{rank_name(r)}] {name} - Chakra: {en:.0f}/{mc:.0f} ({pct:.0f}%) [{status}]", flush=True)
 
             if resting_heroes:
                 recovering = [(h, en, pct, ttr) for h, en, pct, ttr in resting_heroes if ttr > 0 and ttr < 9999]
@@ -457,16 +493,21 @@ def farm_loop(cfg):
                     next_name = next_h.get("name", "?")
                     print(f"  Next hero ready: {next_name} in {format_time(next_ttr)}", flush=True)
 
-            if deployed_ids:
-                sync_result = adventure_sync(token, deployed_ids, active=True)
+            if server_deployed:
+                sync_result = adventure_sync(token, server_deployed, active=True)
                 if "error" in sync_result:
-                    log(f"  Deploy sync error: {sync_result['error']}")
+                    log(f"  Sync error: {sync_result['error']}")
                 else:
-                    log(f"  Synced {len(deployed_ids)} heroes ({total_attacks} attacks reported)")
+                    s_chest = sync_result if "chakra" in sync_result else sync_result.get("chest", sync_result)
+                    new_ack = s_chest.get("attackAck", {})
+                    acked_now = sum(new_ack.values()) if isinstance(new_ack, dict) else 0
+                    new_deployed = s_chest.get("deployed", server_deployed)
+                    server_deployed = new_deployed
+                    current_map_stage = max(1, s_chest.get("map", current_map_stage))
+                    log(f"  Synced {len(server_deployed)} heroes | {total_attacks} atk sent, {acked_now} acked | kills: {kill_totals[0]}")
                     combat_tracker = {}
 
             last_sync_time = time.time()
-            prev_deployed_ids = deployed_ids
 
             sync_counter += 1
             if sync_counter % 5 == 0:
@@ -475,7 +516,7 @@ def farm_loop(cfg):
             sleep_time = poll_interval
             if resting_heroes:
                 recovering = [ttr for _, _, _, ttr in resting_heroes if 0 < ttr < 9999]
-                if recovering and len(deployed_ids) < MAX_DEPLOYED:
+                if recovering and len(server_deployed) < MAX_DEPLOYED:
                     next_ready = min(recovering)
                     if next_ready < poll_interval:
                         sleep_time = max(10, next_ready + 5)
