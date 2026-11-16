@@ -288,12 +288,12 @@ def build_combat_payload(deployed_ids):
     global combat_seq
     combat_seq += 1
     hero_reports = []
-    for tid in deployed_ids:
-        if tid in combat_tracker and combat_tracker[tid]["attacks"] > 0:
+    for tid, data in combat_tracker.items():
+        if data["attacks"] > 0:
             hero_reports.append({
                 "id": tid,
-                "attacks": combat_tracker[tid]["attacks"],
-                "kills": combat_tracker[tid]["kills"][:],
+                "attacks": data["attacks"],
+                "kills": data["kills"][:],
             })
     return {
         "killSession": kill_session,
@@ -313,8 +313,19 @@ def kill_distribution(stage):
     else:
         return [(0, 0.15), (1, 0.30), (2, 0.30), (3, 0.20), (4, 0.05)]
 
+def rebuild_kill_totals():
+    global kill_totals
+    kill_totals = [0, 0, 0, 0, 0, 0, 0, 0]
+    for data in combat_tracker.values():
+        for kind_idx, count in enumerate(data["kills"]):
+            if count <= 0 or kind_idx > 3:
+                continue
+            tally_idx = kind_idx * 2
+            kill_totals[tally_idx] += count
+            kill_totals[tally_idx + 1] += max(0, round(count * 0.08))
+
 def simulate_combat(heroes_data, elapsed_seconds, chakra_map):
-    global combat_tracker, kill_totals
+    global combat_tracker
     dist = kill_distribution(current_map_stage)
     for hero in heroes_data:
         tid = hero.get("tokenId", "")
@@ -335,11 +346,7 @@ def simulate_combat(heroes_data, elapsed_seconds, chakra_map):
         for kind_idx, weight in dist:
             kind_kills = max(0, round(kills * weight))
             combat_tracker[tid]["kills"][kind_idx] += kind_kills
-            tally_idx = kind_idx * 2
-            kill_totals[tally_idx] += kind_kills
-            bonus_kills = max(0, round(kind_kills * 0.08))
-            if bonus_kills > 0 and tally_idx + 1 < len(kill_totals):
-                kill_totals[tally_idx + 1] += bonus_kills
+    rebuild_kill_totals()
 
 def adventure_sync(token, deployed_ids, active=True):
     payload = build_combat_payload(deployed_ids)
@@ -487,7 +494,7 @@ def farm_loop(cfg):
                     ttr = time_to_ready({**h, "en": en}, dojo)
                     resting_heroes.append((h, en, pct, ttr))
 
-            total_attacks = sum(combat_tracker.get(tid, {}).get("attacks", 0) for tid in server_deployed)
+            total_attacks = sum(d["attacks"] for d in combat_tracker.values())
             acked = sum(attack_ack.values()) if isinstance(attack_ack, dict) else 0
 
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] === Shinobi Bombers ===", flush=True)
