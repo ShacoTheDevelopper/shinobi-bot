@@ -455,11 +455,23 @@ def farm_loop(cfg):
             server_deployed = chest.get("deployed", [])
             attack_ack = chest.get("attackAck", {})
 
-            if not server_deployed:
-                deploy_team = select_deploy_team(heroes, chakra_map, dojo)
-                wanted_ids = [h["tokenId"] for h in deploy_team]
-                if wanted_ids:
-                    log(f"  No heroes deployed, sending {len(wanted_ids)} heroes...")
+            napping_ids = set()
+            for tid in server_deployed:
+                ci = chakra_map.get(tid, {})
+                if ci.get("napping") or ci.get("value", 0) < 1:
+                    napping_ids.add(tid)
+
+            need_rotation = not server_deployed or len(napping_ids) >= len(server_deployed) // 2
+
+            if need_rotation:
+                best_team = select_deploy_team(heroes, chakra_map, dojo)
+                wanted_ids = [h["tokenId"] for h in best_team]
+                if not wanted_ids:
+                    still_active = [tid for tid in server_deployed if tid not in napping_ids]
+                    wanted_ids = still_active
+                if wanted_ids and set(wanted_ids) != set(server_deployed):
+                    action = "Rotating" if server_deployed else "Deploying"
+                    log(f"  {action} heroes: {len(napping_ids)} napping, sending {len(wanted_ids)} fresh...")
                     deploy_resp = adventure_sync(token, wanted_ids, active=True)
                     if "error" not in deploy_resp:
                         d_chest = deploy_resp if "chakra" in deploy_resp else deploy_resp.get("chest", deploy_resp)
