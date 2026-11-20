@@ -324,8 +324,10 @@ def rebuild_kill_totals():
             kill_totals[tally_idx] += count
             kill_totals[tally_idx + 1] += max(0, round(count * 0.08))
 
-def simulate_combat(heroes_data, elapsed_seconds, chakra_map):
+def simulate_combat(heroes_data, elapsed_seconds, chakra_map, ack_map=None):
     global combat_tracker
+    if ack_map is None:
+        ack_map = {}
     dist = kill_distribution(current_map_stage)
     for hero in heroes_data:
         tid = hero.get("tokenId", "")
@@ -336,7 +338,13 @@ def simulate_combat(heroes_data, elapsed_seconds, chakra_map):
         napping = chakra_info.get("napping")
         if napping or available < 1:
             continue
-        num_attacks = attacks_in_interval(hero, elapsed_seconds, available)
+        local_attacks = combat_tracker.get(tid, {}).get("attacks", 0)
+        acked = ack_map.get(tid, 0) if isinstance(ack_map, dict) else 0
+        pending = max(0, local_attacks - acked)
+        effective = max(0, available - pending)
+        if effective < 1:
+            continue
+        num_attacks = attacks_in_interval(hero, elapsed_seconds, effective)
         if num_attacks <= 0:
             continue
         if tid not in combat_tracker:
@@ -406,6 +414,7 @@ def farm_loop(cfg):
     start_chest = None
     prev_chakra_map = {}
     prev_hero_map = {}
+    prev_attack_ack = {}
 
     while True:
         try:
@@ -438,7 +447,7 @@ def farm_loop(cfg):
                     if h:
                         active_heroes.append(h)
                 if active_heroes and elapsed_since_sync > 0:
-                    simulate_combat(active_heroes, elapsed_since_sync, prev_chakra_map)
+                    simulate_combat(active_heroes, elapsed_since_sync, prev_chakra_map, prev_attack_ack)
 
             sync_resp = adventure_sync(token, server_deployed, active=True)
             if "error" in sync_resp:
@@ -466,12 +475,10 @@ def farm_loop(cfg):
             if need_rotation:
                 best_team = select_deploy_team(heroes, chakra_map, dojo)
                 wanted_ids = [h["tokenId"] for h in best_team]
-                if not wanted_ids:
-                    still_active = [tid for tid in server_deployed if tid not in napping_ids]
-                    wanted_ids = still_active
-                if wanted_ids and set(wanted_ids) != set(server_deployed):
+                new_heroes = set(wanted_ids) - set(server_deployed)
+                if wanted_ids and new_heroes:
                     action = "Rotating" if server_deployed else "Deploying"
-                    log(f"  {action} heroes: {len(napping_ids)} napping, sending {len(wanted_ids)} fresh...")
+                    log(f"  {action}: {len(napping_ids)} napping, {len(new_heroes)} fresh of {len(wanted_ids)} team...")
                     deploy_resp = adventure_sync(token, wanted_ids, active=True)
                     if "error" not in deploy_resp:
                         d_chest = deploy_resp if "chakra" in deploy_resp else deploy_resp.get("chest", deploy_resp)
@@ -480,6 +487,8 @@ def farm_loop(cfg):
                         chest_pending = d_chest.get("pending", chest_pending)
                         attack_ack = d_chest.get("attackAck", {})
                         log(f"  Server accepted {len(server_deployed)} heroes")
+                elif not server_deployed:
+                    log(f"  All heroes exhausted, waiting for recovery...")
 
             if start_time is None:
                 start_time = time.time()
@@ -535,6 +544,7 @@ def farm_loop(cfg):
             last_sync_time = time.time()
             prev_chakra_map = chakra_map
             prev_hero_map = hero_map
+            prev_attack_ack = attack_ack
 
             sync_counter += 1
             if sync_counter % 5 == 0:
